@@ -273,13 +273,36 @@ class TokenLoader:
 # MODEL BLOCKS
 # ==============================================================================
 
+def fake_quant_array(w: mx.array) -> mx.array:
+    if w.size <= 65536:
+        w_f16 = w.astype(mx.float16)
+        return w + mx.stop_gradient(w_f16.astype(w.dtype) - w)
+    
+    w_f32 = w.astype(mx.float32)
+    if w.ndim == 2:
+        abs_max = mx.max(mx.abs(w_f32), axis=1, keepdims=True)
+        scale = mx.maximum(abs_max / 127.0, 1.0 / 127.0)
+        w_q = mx.round(w_f32 / scale)
+        w_q = mx.clip(w_q, -127.0, 127.0)
+        w_dq = w_q * scale
+        return w + mx.stop_gradient(w_dq - w)
+    else:
+        abs_max = mx.max(mx.abs(w_f32))
+        scale = mx.maximum(abs_max / 127.0, 1.0 / 127.0)
+        w_q = mx.round(w_f32 / scale)
+        w_q = mx.clip(w_q, -127.0, 127.0)
+        w_dq = w_q * scale
+        return w + mx.stop_gradient(w_dq - w)
+
+
 class CastedLinear(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
         self.weight = nn.Linear(in_dim, out_dim, bias=False).weight.astype(mx.float32)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return x @ self.weight.astype(x.dtype).T
+        w = fake_quant_array(self.weight)
+        return x @ w.astype(x.dtype).T
 
 
 class RMSNormNoWeight(nn.Module):
@@ -390,19 +413,18 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
+        self.num_layers = num_layers
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = mx.ones((self.num_skip_weights, dim), dtype=mx.float32)
-        self.blocks = [
-            Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-            for i in range(num_layers)
-        ]
+        
+        # Looped architecture uses a single block
+        self.block = Block(dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
         self.final_norm = RMSNormNoWeight()
 
-        for b in self.blocks:
-            b.attn.proj.weight = mx.zeros_like(b.attn.proj.weight)
-            b.mlp.proj.weight = mx.zeros_like(b.mlp.proj.weight)
+        self.block.attn.proj.weight = mx.zeros_like(self.block.attn.proj.weight)
+        self.block.mlp.proj.weight = mx.zeros_like(self.block.mlp.proj.weight)
         self.tok_emb.weight = (
             mx.random.normal(self.tok_emb.weight.shape, dtype=mx.float32) * tied_embed_init_std
         ).astype(COMPUTE_DTYPE)
@@ -412,12 +434,13 @@ class GPT(nn.Module):
         return c * mx.tanh(logits / c)
 
     def __call__(self, input_ids: mx.array) -> mx.array:
-        x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        w_emb = fake_quant_array(self.tok_emb.weight)
+        x = rms_norm(w_emb[input_ids].astype(COMPUTE_DTYPE))
         x0 = x
         skips: list[mx.array] = []
 
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.block(x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             # Odd layer counts have one more decoder block than encoder block. The baseline only
@@ -425,16 +448,17 @@ class GPT(nn.Module):
             # without an added skip.
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.block(x, x0)
         return self.final_norm(x)
 
     def loss(self, input_ids: mx.array, target_ids: mx.array) -> mx.array:
         # Cross-entropy over flattened tokens. We keep optional logit chunking because it is a useful
         # memory knob on Macs, but the common path is chunk_tokens=0 (single matmul + CE).
-        x = self(input_ids).reshape(-1, self.tok_emb.weight.shape[1])
+        w_emb = fake_quant_array(self.tok_emb.weight)
+        x = self(input_ids).reshape(-1, w_emb.shape[1])
         y = target_ids.reshape(-1)
         if self.logit_chunk_tokens <= 0 or x.shape[0] <= self.logit_chunk_tokens:
-            logits_proj = x @ self.tok_emb.weight.astype(x.dtype).T
+            logits_proj = x @ w_emb.astype(x.dtype).T
             logits = self.softcap(logits_proj)
             return nn.losses.cross_entropy(logits.astype(mx.float32), y, reduction="mean")
 
@@ -442,7 +466,7 @@ class GPT(nn.Module):
         n = int(x.shape[0])
         for s in range(0, n, self.logit_chunk_tokens):
             e = min(s + self.logit_chunk_tokens, n)
-            logits_proj = x[s:e] @ self.tok_emb.weight.astype(x.dtype).T
+            logits_proj = x[s:e] @ w_emb.astype(x.dtype).T
             logits = self.softcap(logits_proj)
             loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
         return loss_sum / float(n)
@@ -490,12 +514,12 @@ class SplitOptimizers:
         self.matrix_keys = [
             k
             for k, p in params.items()
-            if k.startswith("blocks.") and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+            if (k.startswith("blocks.") or k.startswith("block.")) and p.ndim == 2 and not any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)
         ]
         self.scalar_keys = [
             k
             for k, p in params.items()
-            if k == "skip_weights" or (k.startswith("blocks.") and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
+            if k == "skip_weights" or ((k.startswith("blocks.") or k.startswith("block.")) and (p.ndim < 2 or any(pattern in k for pattern in CONTROL_TENSOR_NAME_PATTERNS)))
         ]
 
         self.muon = Muon(self.matrix_keys, params, args)
@@ -947,7 +971,7 @@ def main() -> None:
     log(f"compute_dtype:{COMPUTE_DTYPE} compile:True")
     log(
         f"dtypes tok_emb:{model.tok_emb.weight.dtype} "
-        f"linear_weight:{model.blocks[0].attn.c_q.weight.dtype} "
+        f"linear_weight:{model.block.attn.c_q.weight.dtype} "
         f"skip_weights:{model.skip_weights.dtype}"
     )
 
