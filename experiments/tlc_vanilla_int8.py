@@ -12,7 +12,6 @@ import time
 import uuid
 import zlib
 from pathlib import Path
-from dataclasses import dataclass
 
 import numpy as np
 import sentencepiece as spm
@@ -25,51 +24,52 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
-@dataclass
 class Hyperparameters:
-    data_path: str = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
-    train_files: str = os.path.join(data_path, "fineweb_train_*.bin")
-    val_files: str = os.path.join(data_path, "fineweb_val_*.bin")
-    tokenizer_path: str = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
-    run_id: str = os.environ.get("RUN_ID", str(uuid.uuid4()))
-    seed: int = 1337
+    # Using a plain class (not @dataclass) so field defaults can reference each other
+    # correctly when DATA_PATH is overridden via env var.
+    data_path = os.environ.get("DATA_PATH", "./data/datasets/fineweb10B_sp1024")
+    train_files = os.path.join(data_path, "fineweb_train_*.bin")
+    val_files = os.path.join(data_path, "fineweb_val_*.bin")
+    tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+    seed = 1337
 
-    val_batch_size: int = 524288
-    val_loss_every: int = 1000
-    train_log_every: int = 200
+    val_batch_size = 524288
+    val_loss_every = 1000
+    train_log_every = 200
 
-    iterations: int = 20000
-    warmdown_iters: int = 3000
-    warmup_steps: int = 20
-    train_batch_tokens: int = 393216
-    train_seq_len: int = 4096
-    max_wallclock_seconds: float = 600.0
-    qk_gain_init: float = 1.0
+    iterations = 20000
+    warmdown_iters = 3000
+    warmup_steps = 20
+    train_batch_tokens = 393216
+    train_seq_len = 4096
+    max_wallclock_seconds = 600.0
+    qk_gain_init = 1.0
 
-    vocab_size: int = 1024
-    num_layers: int = 3  # Unique blocks; looped 3x for 9 effective layers
-    num_kv_heads: int = 8
-    model_dim: int = 1024
-    num_heads: int = 16
-    mlp_mult: float = 3.0
-    tie_embeddings: bool = True
-    rope_base: float = 10000.0
-    logit_softcap: float = 30.0
+    vocab_size = 1024
+    num_layers = 3  # Unique blocks; looped 3x for 9 effective layers
+    num_kv_heads = 8
+    model_dim = 1024
+    num_heads = 16
+    mlp_mult = 3.0
+    tie_embeddings = True
+    rope_base = 10000.0
+    logit_softcap = 30.0
 
-    embed_lr: float = 0.6
-    head_lr: float = 0.01
-    tied_embed_lr: float = 0.04
-    tied_embed_init_std: float = 0.005
-    matrix_lr: float = 0.02
-    scalar_lr: float = 0.04
-    muon_momentum: float = 0.95
-    muon_backend_steps: int = 5
-    muon_momentum_warmup_start: float = 0.85
-    muon_momentum_warmup_steps: int = 1500
-    beta1: float = 0.9
-    beta2: float = 0.95
-    adam_eps: float = 1e-8
-    grad_clip_norm: float = 0.0
+    embed_lr = 0.6
+    head_lr = 0.01
+    tied_embed_lr = 0.04
+    tied_embed_init_std = 0.005
+    matrix_lr = 0.02
+    scalar_lr = 0.04
+    muon_momentum = 0.95
+    muon_backend_steps = 5
+    muon_momentum_warmup_start = 0.85
+    muon_momentum_warmup_steps = 1500
+    beta1 = 0.9
+    beta2 = 0.95
+    adam_eps = 1e-8
+    grad_clip_norm = 0.0
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -423,19 +423,7 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
-    base_model = GPT(
-        vocab_size=args.vocab_size,
-        num_layers=args.num_layers,
-        model_dim=args.model_dim,
-        num_heads=args.num_heads,
-        num_kv_heads=args.num_kv_heads,
-        mlp_mult=args.mlp_mult,
-        tie_embeddings=args.tie_embeddings,
-        tied_embed_init_std=args.tied_embed_init_std,
-        logit_softcap=args.logit_softcap,
-        rope_base=args.rope_base,
-        qk_gain_init=args.qk_gain_init,
-    ).to(device).bfloat16()
+    base_model = GPT(args).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -451,15 +439,21 @@ def main() -> None:
     
     # We collect all parameters not handled by special optimizers (tok_emb, lm_head)
     # and split them into matrix (2D) and scalar/vector (<2D or control) groups.
-    matrix_params = []
-    scalar_params = []
-    for name, p in base_model.named_parameters():
-        if any(x in name for x in ("tok_emb", "lm_head")):
-            continue
-        if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS):
-            matrix_params.append(p)
-        else:
-            scalar_params.append(p)
+    # Only route block parameters through Muon / scalar Adam; tok_emb and lm_head
+    # get their own optimizers below so they must NOT appear here as well.
+    block_named_params = list(base_model.blocks.named_parameters())
+    matrix_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim == 2 and not any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    scalar_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim < 2 or any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    # loop_embeds live outside blocks — add them to the scalar group.
+    scalar_params.append(base_model.loop_embeds)
 
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
@@ -483,7 +477,10 @@ def main() -> None:
         fused=True,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
-    if base_model.lm_head is not None:
+    # Only create a separate head optimizer when embeddings are NOT tied.
+    # When tie_embeddings=True the lm_head weight IS tok_emb.weight, so adding
+    # it to a second optimizer would cause double-updates on the same tensor.
+    if not args.tie_embeddings:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
             betas=(args.beta1, args.beta2),
@@ -495,7 +492,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
-    log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
+    log0("sdp_backends:cudnn=False flash=True mem_efficient=True math=True")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
