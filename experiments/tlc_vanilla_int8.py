@@ -351,7 +351,7 @@ def main() -> None:
     logfile = None
     if master_process:
         os.makedirs("logs", exist_ok=True)
-        logfile = f"logs/{args.run_id}.txt"
+        logfile = f"logs/{args.run_id}_seed{args.seed}.txt"
         print(logfile)
 
     def log0(msg: str, console: bool = True) -> None:
