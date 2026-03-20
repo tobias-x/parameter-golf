@@ -147,34 +147,14 @@ def dequantize_state_dict_int8(obj: dict) -> dict[str, Tensor]:
     return out
 
 # -----------------------------
-# CASTED LINEAR (Used for centroids-ready models)
+# CASTED LINEAR
 # -----------------------------
 
-def quant_nearest(w: Tensor, centroids: Tensor) -> Tensor:
-    w_f32 = w.float()
-    original_shape = w.shape
-    w_flat = w_f32.view(-1, 1)
-    score = torch.square(centroids) - 2.0 * w_flat * centroids
-    idx = torch.argmin(score, dim=-1)
-    return centroids[idx].view(original_shape).to(w.dtype)
-
 class CastedLinear(nn.Linear):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, dtype=None):
-        super().__init__(in_features, out_features, bias, device, dtype)
-        # Per-layer centroids!
-        self.centroids = nn.Parameter(torch.linspace(-0.2, 0.2, 64, dtype=torch.float32))
-        
-    def forward(self, x: Tensor, time_min: Tensor = None, is_snap: bool = False) -> Tensor:
-        # Note: tlc_vanilla_int8.py by default uses standard forward paths.
-        # This class is provided as a reference/target for centroid-based experiments.
-        w = self.weight
-        if w.numel() > 65536 and is_snap:
-            w_q = quant_nearest(w, self.centroids)
-            w_eff = w + (w_q - w).detach() # STE
-        else:
-            w_eff = w
+    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, w_eff.to(x.dtype), bias)
+        return F.linear(x, self.weight.to(x.dtype), bias)
 
 # -----------------------------
 # DATA LOADING
