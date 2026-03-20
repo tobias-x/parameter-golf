@@ -42,7 +42,7 @@ class Hyperparameters:
     warmdown_iters = 1000
     warmup_steps = 20
     train_batch_tokens = 393216
-    train_seq_len = 1024
+    train_seq_len = 4096
     max_wallclock_seconds = 600.0
     qk_gain_init = 1.0
 
