@@ -121,29 +121,117 @@ class Muon(torch.optim.Optimizer):
 # -----------------------------
 # QUANTIZATION
 # -----------------------------
-CONTROL_TENSOR_NAME_PATTERNS = ("q_gain", "attn_scale", "mlp_scale", "resid_mix", "loop_embeds")
+CONTROL_TENSOR_NAME_PATTERNS = ("q_gain", "k_gain", "attn_scale", "mlp_scale", "resid_mix", "loop_embeds")
+INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = CONTROL_TENSOR_NAME_PATTERNS
+INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
+INT8_PER_ROW_SCALE_DTYPE = torch.float16
+INT8_CLIP_PERCENTILE = 99.99984
+INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
+
+def tensor_nbytes(t: Tensor) -> int:
+    return int(t.numel()) * int(t.element_size())
+
+def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, str]) -> Tensor:
+    if any(pattern in name for pattern in INT8_KEEP_FLOAT_FP32_NAME_PATTERNS):
+        return t.float().contiguous()
+    if t.dtype in {torch.float32, torch.bfloat16}:
+        passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+        return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
+    return t
+
+def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
+    t32 = t.float()
+    if t32.ndim == 2:
+        # Per-row scale with percentile clipping — robust to weight outliers.
+        clip_abs = (
+            torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+            if t32.numel()
+            else torch.empty((t32.shape[0],), dtype=torch.float32)
+        )
+        clipped = torch.maximum(torch.minimum(t32, clip_abs[:, None]), -clip_abs[:, None])
+        scale = (clip_abs / 127.0).clamp_min(1.0 / 127.0)
+        q = torch.clamp(torch.round(clipped / scale[:, None]), -127, 127).to(torch.int8).contiguous()
+        return q, scale.to(dtype=INT8_PER_ROW_SCALE_DTYPE).contiguous()
+    # Vectors/scalars: per-tensor scale.
+    clip_abs = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+    scale = torch.tensor(clip_abs / 127.0 if clip_abs > 0 else 1.0, dtype=torch.float32)
+    q = torch.clamp(torch.round(torch.clamp(t32, -clip_abs, clip_abs) / scale), -127, 127).to(torch.int8).contiguous()
+    return q, scale
 
 def quantize_state_dict_int8(state_dict: dict[str, Tensor]):
-    quantized, scales, passthrough, dtypes = {}, {}, {}, {}
-    stats = {"baseline_tensor_bytes": 0, "int8_payload_bytes": 0}
-    for name, t in state_dict.items():
-        t = t.detach().cpu()
-        stats["baseline_tensor_bytes"] += t.numel() * t.element_size()
-        if t.ndim == 2 and not any(p in name for p in ("tok_emb", "lm_head")):
-            scale = (t.abs().max(dim=1, keepdim=True).values / 127.0).clamp_min(1e-5)
-            q = (t.float() / scale).round().clamp(-127, 127).to(torch.int8)
-            quantized[name], scales[name], dtypes[name] = q, scale.half(), str(t.dtype).removeprefix("torch.")
-            stats["int8_payload_bytes"] += q.numel() + scales[name].numel() * 2
-        else:
-            passthrough[name] = t.half() if t.is_floating_point() else t
-            stats["int8_payload_bytes"] += passthrough[name].numel() * passthrough[name].element_size()
-    return {"quantized": quantized, "scales": scales, "passthrough": passthrough, "dtypes": dtypes}, stats
+    quantized: dict[str, Tensor] = {}
+    scales: dict[str, Tensor] = {}
+    dtypes: dict[str, str] = {}
+    passthrough: dict[str, Tensor] = {}
+    passthrough_orig_dtypes: dict[str, str] = {}
+    qmeta: dict[str, dict[str, object]] = {}
+    stats = dict.fromkeys(
+        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"),
+        0,
+    )
+    for name, tensor in state_dict.items():
+        t = tensor.detach().to("cpu").contiguous()
+        stats["param_count"] += int(t.numel())
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
+        if not t.is_floating_point():
+            stats["num_nonfloat_tensors"] += 1
+            passthrough[name] = t
+            stats["int8_payload_bytes"] += tensor_nbytes(t)
+            continue
+        # Keep embeddings in fp16 — quantising the tied weight hurts both input and output paths.
+        if "tok_emb" in name:
+            kept = t.to(dtype=torch.float16).contiguous()
+            passthrough[name] = kept
+            passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
+        # Small tensors: keep as float rather than pay int8+scale overhead.
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += tensor_nbytes(kept)
+            continue
+        stats["num_float_tensors"] += 1
+        q, s = quantize_float_tensor(t)
+        if s.ndim > 0:
+            qmeta[name] = {"scheme": "per_row", "axis": 0}
+        quantized[name] = q
+        scales[name] = s
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        stats["int8_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
+    obj: dict[str, object] = {
+        "__quant_format__": "int8_clean_per_row_v1",
+        "quantized": quantized,
+        "scales": scales,
+        "dtypes": dtypes,
+        "passthrough": passthrough,
+    }
+    if qmeta:
+        obj["qmeta"] = qmeta
+    if passthrough_orig_dtypes:
+        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
 
-def dequantize_state_dict_int8(obj: dict) -> dict[str, Tensor]:
-    out = {name: t.float() for name, t in obj["passthrough"].items()}
+def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
+    out: dict[str, Tensor] = {}
+    qmeta = obj.get("qmeta", {})
+    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
     for name, q in obj["quantized"].items():
         dtype = getattr(torch, obj["dtypes"][name])
-        out[name] = (q.float() * obj["scales"][name].float().view(-1, 1)).to(dtype)
+        s = obj["scales"][name]
+        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+            s = s.to(dtype=torch.float32)
+            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dtype=dtype).contiguous()
+        else:
+            out[name] = (q.float() * float(s.item())).to(dtype=dtype).contiguous()
+    for name, t in obj["passthrough"].items():
+        out_t = t.detach().to("cpu").contiguous()
+        orig_dtype = passthrough_orig_dtypes.get(name)
+        if isinstance(orig_dtype, str):
+            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
+        out[name] = out_t
     return out
 
 # -----------------------------
@@ -262,6 +350,10 @@ class Block(nn.Module):
         self.mlp_out = nn.Linear(int(h.model_dim * h.mlp_mult), h.model_dim, bias=False)
         self.q_gain = nn.Parameter(torch.full((h.num_heads,), h.qk_gain_init))
         self.k_gain = nn.Parameter(torch.ones(h.num_kv_heads))
+        # Per-dim learned output gates — let each sub-layer control its residual contribution.
+        # Especially important in recursive models where the same block runs at 3 effective depths.
+        self.attn_scale = nn.Parameter(torch.ones(h.model_dim, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.ones(h.model_dim, dtype=torch.float32))
 
     def forward(self, x, x0, cos, sin):
         r = self.an(x)
@@ -274,9 +366,9 @@ class Block(nn.Module):
         k = F.rms_norm(k, (self.hd,)) * self.k_gain[None, :, None, None]
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=(self.h.num_kv_heads != self.h.num_heads))
-        x = x + self.proj(y.transpose(1, 2).reshape(x.shape))
+        x = x + self.attn_scale.to(x.dtype)[None, None, :] * self.proj(y.transpose(1, 2).reshape(x.shape))
         r = self.mn(x)
-        x = x + self.mlp_out(F.relu(self.fc(r)).square())
+        x = x + self.mlp_scale.to(x.dtype)[None, None, :] * self.mlp_out(F.relu(self.fc(r)).square())
         return x
 
 class GPT(nn.Module):
