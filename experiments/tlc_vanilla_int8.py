@@ -293,7 +293,7 @@ class Block(nn.Module):
         q = F.rms_norm(q, (self.hd,)) * self.q_gain[None, :, None, None]
         k = F.rms_norm(k, (self.hd,)) * self.k_gain[None, :, None, None]
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=(self.h.num_kv_heads != self.h.num_heads))
         x = x + self.proj(y.transpose(1, 2).reshape(x.shape))
         r = self.mn(x)
         x = x + self.mlp_out(F.relu(self.fc(r)).square())
