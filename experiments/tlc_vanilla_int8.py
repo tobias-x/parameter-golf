@@ -48,9 +48,9 @@ class Hyperparameters:
 
     vocab_size = 1024
     num_layers = 3  # Unique blocks; looped num_loops times for num_layers*num_loops effective layers
-    num_loops = 3   # 3 blocks × 4 loops = 12 effective layers
+    num_loops = 3   # 3 blocks × 3 loops = 9 effective layers
     num_kv_heads = 6
-    model_dim = 864
+    model_dim = 816
     num_heads = 12
     mlp_mult = 2.5
     tie_embeddings = True
@@ -61,16 +61,16 @@ class Hyperparameters:
     head_lr = 0.01
     tied_embed_lr = 0.04
     tied_embed_init_std = 0.006
-    matrix_lr = 0.03
+    matrix_lr = 0.04
     scalar_lr = 0.03
     muon_momentum = 0.95
-    muon_backend_steps = 5
+    muon_backend_steps = 10
     muon_momentum_warmup_start = 0.85
     muon_momentum_warmup_steps = 800
     beta1 = 0.9
     beta2 = 0.95
     adam_eps = 1e-8
-    grad_clip_norm = 0.5  # Recursive model: gradients sum across 3 loop passes, so effective grad is ~3x larger
+    grad_clip_norm = 0.0  # Disabled: higher NS steps + resid_mix stabilise gradients sufficiently
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -122,7 +122,7 @@ class Muon(torch.optim.Optimizer):
 # -----------------------------
 # QUANTIZATION
 # -----------------------------
-CONTROL_TENSOR_NAME_PATTERNS = ("q_gain", "k_gain", "attn_scale", "mlp_scale", "resid_mix", "loop_embeds")
+CONTROL_TENSOR_NAME_PATTERNS = ("q_gain", "k_gain", "attn_scale", "mlp_scale", "resid_mix", "loop_embeds", "loop_skip")
 INT8_KEEP_FLOAT_FP32_NAME_PATTERNS = CONTROL_TENSOR_NAME_PATTERNS
 INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
 INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
@@ -355,8 +355,16 @@ class Block(nn.Module):
         # Especially important in recursive models where the same block runs at 3 effective depths.
         self.attn_scale = nn.Parameter(torch.ones(h.model_dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(h.model_dim, dtype=torch.float32))
+        # resid_mix: learned per-dim blend of current x and initial embedding x0.
+        # Lets each block decide how much to "refresh" from the original token embedding.
+        # Especially valuable in recursive models where x drifts far from x0 over 9 loops.
+        # Initialised as [1, 0] so it starts as identity (no change to existing behaviour).
+        self.resid_mix = nn.Parameter(torch.stack([torch.ones(h.model_dim), torch.zeros(h.model_dim)]).float())
 
     def forward(self, x, x0, cos, sin):
+        # Blend current representation with initial embedding — learned per-dim mix.
+        mix = self.resid_mix.to(x.dtype)
+        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         r = self.an(x)
         qkv = self.qkv(r)
         q, k, v = qkv.split([self.h.model_dim, self.h.num_kv_heads * self.hd, self.h.num_kv_heads * self.hd], -1)
@@ -378,6 +386,10 @@ class GPT(nn.Module):
         self.h = h
         self.tok_emb = nn.Embedding(h.vocab_size, h.model_dim)
         self.loop_embeds = nn.Parameter(torch.zeros(h.num_loops, h.model_dim))
+        # Cross-cycle skip: passes cycle-0 output directly into cycle-(num_loops-1) input.
+        # Analogous to U-net encoder→decoder skip, gives the last loop direct access to
+        # early representations without relying on cycle-1 to route them through.
+        self.loop_skip_weight = nn.Parameter(torch.zeros(h.model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([Block(h) for _ in range(h.num_layers)])
         self.final_norm = nn.RMSNorm(h.model_dim)
         self.rope = Rotary(h.model_dim // h.num_heads, h.rope_base)
@@ -389,9 +401,15 @@ class GPT(nn.Module):
         cos, sin = self.rope(idx.size(1), idx.device)
         x = F.rms_norm(self.tok_emb(idx), (self.h.model_dim,))
         x0 = x
+        x_cycle0 = None
         for cycle in range(self.h.num_loops):
             x = x + self.loop_embeds[cycle]
+            # Last loop: inject skip from end of cycle 0 for direct early→late signal.
+            if cycle == self.h.num_loops - 1 and x_cycle0 is not None:
+                x = x + self.loop_skip_weight.to(x.dtype)[None, None, :] * x_cycle0
             for b in self.blocks: x = b(x, x0, cos, sin)
+            if cycle == 0:
+                x_cycle0 = x
         logits = self.h.logit_softcap * torch.tanh(self.lm_head(self.final_norm(x)) / self.h.logit_softcap)
         return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) if targets is not None else logits
 
