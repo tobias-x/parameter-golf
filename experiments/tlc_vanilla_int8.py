@@ -50,7 +50,7 @@ class Hyperparameters:
     num_layers = 3  # Unique blocks; looped num_loops times for num_layers*num_loops effective layers
     num_loops = 4   # 3 blocks × 4 loops = 12 effective layers
     num_kv_heads = 6
-    model_dim = 768
+    model_dim = 864
     num_heads = 12
     mlp_mult = 2.5
     tie_embeddings = True
@@ -61,7 +61,7 @@ class Hyperparameters:
     head_lr = 0.01
     tied_embed_lr = 0.04
     tied_embed_init_std = 0.005
-    matrix_lr = 0.015
+    matrix_lr = 0.012
     scalar_lr = 0.02
     muon_momentum = 0.95
     muon_backend_steps = 5
