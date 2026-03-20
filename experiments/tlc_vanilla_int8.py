@@ -35,7 +35,7 @@ class Hyperparameters:
     seed = 1337
 
     val_batch_size = 524288
-    val_loss_every = 1000
+    val_loss_every = 100000
     train_log_every = 200
 
     iterations = 20000
