@@ -39,7 +39,7 @@ class Hyperparameters:
     train_log_every = 200
 
     iterations = 20000
-    warmdown_iters = 3000
+    warmdown_iters = 1000
     warmup_steps = 20
     train_batch_tokens = 393216
     train_seq_len = 4096
@@ -65,11 +65,11 @@ class Hyperparameters:
     muon_momentum = 0.95
     muon_backend_steps = 5
     muon_momentum_warmup_start = 0.85
-    muon_momentum_warmup_steps = 1500
+    muon_momentum_warmup_steps = 800
     beta1 = 0.9
     beta2 = 0.95
     adam_eps = 1e-8
-    grad_clip_norm = 0.0
+    grad_clip_norm = 0.5  # Recursive model: gradients sum across 3 loop passes, so effective grad is ~3x larger
 
 # -----------------------------
 # MUON OPTIMIZER
