@@ -48,10 +48,10 @@ class Hyperparameters:
 
     vocab_size = 1024
     num_layers = 3  # Unique blocks; looped 3x for 9 effective layers
-    num_kv_heads = 8
-    model_dim = 1024
-    num_heads = 16
-    mlp_mult = 3.0
+    num_kv_heads = 6
+    model_dim = 768
+    num_heads = 12
+    mlp_mult = 2.5
     tie_embeddings = True
     rope_base = 10000.0
     logit_softcap = 30.0
