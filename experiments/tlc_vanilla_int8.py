@@ -60,9 +60,9 @@ class Hyperparameters:
     embed_lr = 0.5
     head_lr = 0.01
     tied_embed_lr = 0.04
-    tied_embed_init_std = 0.005
-    matrix_lr = 0.012
-    scalar_lr = 0.02
+    tied_embed_init_std = 0.006
+    matrix_lr = 0.03
+    scalar_lr = 0.03
     muon_momentum = 0.95
     muon_backend_steps = 5
     muon_momentum_warmup_start = 0.85
