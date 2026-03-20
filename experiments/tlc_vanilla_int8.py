@@ -42,12 +42,13 @@ class Hyperparameters:
     warmdown_iters = 1000
     warmup_steps = 20
     train_batch_tokens = 393216
-    train_seq_len = 4096
+    train_seq_len = 1024
     max_wallclock_seconds = 600.0
     qk_gain_init = 1.0
 
     vocab_size = 1024
-    num_layers = 3  # Unique blocks; looped 3x for 9 effective layers
+    num_layers = 3  # Unique blocks; looped num_loops times for num_layers*num_loops effective layers
+    num_loops = 4   # 3 blocks × 4 loops = 12 effective layers
     num_kv_heads = 6
     model_dim = 768
     num_heads = 12
@@ -60,7 +61,7 @@ class Hyperparameters:
     head_lr = 0.01
     tied_embed_lr = 0.04
     tied_embed_init_std = 0.005
-    matrix_lr = 0.01
+    matrix_lr = 0.015
     scalar_lr = 0.02
     muon_momentum = 0.95
     muon_backend_steps = 5
@@ -376,7 +377,7 @@ class GPT(nn.Module):
         super().__init__()
         self.h = h
         self.tok_emb = nn.Embedding(h.vocab_size, h.model_dim)
-        self.loop_embeds = nn.Parameter(torch.zeros(3, h.model_dim))
+        self.loop_embeds = nn.Parameter(torch.zeros(h.num_loops, h.model_dim))
         self.blocks = nn.ModuleList([Block(h) for _ in range(h.num_layers)])
         self.final_norm = nn.RMSNorm(h.model_dim)
         self.rope = Rotary(h.model_dim // h.num_heads, h.rope_base)
@@ -388,7 +389,7 @@ class GPT(nn.Module):
         cos, sin = self.rope(idx.size(1), idx.device)
         x = F.rms_norm(self.tok_emb(idx), (self.h.model_dim,))
         x0 = x
-        for cycle in range(3):
+        for cycle in range(self.h.num_loops):
             x = x + self.loop_embeds[cycle]
             for b in self.blocks: x = b(x, x0, cos, sin)
         logits = self.h.logit_softcap * torch.tanh(self.lm_head(self.final_norm(x)) / self.h.logit_softcap)
