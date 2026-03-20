@@ -48,7 +48,7 @@ class Hyperparameters:
 
     vocab_size = 1024
     num_layers = 3  # Unique blocks; looped num_loops times for num_layers*num_loops effective layers
-    num_loops = 4   # 3 blocks × 4 loops = 12 effective layers
+    num_loops = 3   # 3 blocks × 4 loops = 12 effective layers
     num_kv_heads = 6
     model_dim = 864
     num_heads = 12
